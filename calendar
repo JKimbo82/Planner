@@ -1,0 +1,119 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/lib/auth';
+import { 
+  fetchCalendarEvents, 
+  createCalendarEvent, 
+  updateCalendarEvent,
+  deleteCalendarEvent,
+  slotToCalendarEvent,
+  getTimeZone,
+} from '@/lib/google-calendar';
+import { ScheduleSlot, Activity } from '@/lib/types';
+
+export async function POST(request: NextRequest) {
+  try {
+    const session = await getServerSession(authOptions);
+    
+    if (!session?.accessToken) {
+      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+    }
+
+    const { schedule, activities, action } = await request.json();
+    const timeZone = getTimeZone();
+
+    if (action === 'export') {
+      // Export schedule to Google Calendar
+      const results = { created: 0, updated: 0, errors: [] as string[] };
+      
+      for (const slot of schedule as ScheduleSlot[]) {
+        if (!slot.activityIds || slot.activityIds.length === 0) continue;
+        
+        // Find all activities for this slot
+        const slotActivities = slot.activityIds
+          .map(id => (activities as Activity[]).find(a => a.id === id))
+          .filter((a): a is Activity => a !== undefined);
+        
+        if (slotActivities.length === 0) continue;
+
+        try {
+          const event = slotToCalendarEvent(slot, slotActivities, timeZone);
+          
+          if (slot.googleEventId) {
+            // Update existing event
+            await updateCalendarEvent(session.accessToken, slot.googleEventId, event);
+            results.updated++;
+          } else {
+            // Create new event
+            const eventId = await createCalendarEvent(session.accessToken, event);
+            // Note: In a real app, you'd want to save this eventId back to the slot
+            results.created++;
+          }
+        } catch (error: any) {
+          const activityNames = slotActivities.map(a => a.name).join(', ');
+          results.errors.push(`Failed to sync ${activityNames}: ${error.message}`);
+        }
+      }
+
+      return NextResponse.json({
+        success: true,
+        ...results,
+        syncTime: new Date().toISOString(),
+      });
+    }
+
+    if (action === 'import') {
+      // Import events from Google Calendar
+      const { startDate, endDate } = await request.json();
+      
+      const events = await fetchCalendarEvents(
+        session.accessToken,
+        startDate,
+        endDate
+      );
+
+      return NextResponse.json({
+        success: true,
+        events,
+        syncTime: new Date().toISOString(),
+      });
+    }
+
+    return NextResponse.json({ error: 'Invalid action' }, { status: 400 });
+  } catch (error: any) {
+    console.error('Calendar sync error:', error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
+
+export async function GET(request: NextRequest) {
+  try {
+    const session = await getServerSession(authOptions);
+    
+    if (!session?.accessToken) {
+      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 });
+    }
+
+    const { searchParams } = new URL(request.url);
+    const startDate = searchParams.get('startDate');
+    const endDate = searchParams.get('endDate');
+
+    if (!startDate || !endDate) {
+      return NextResponse.json({ error: 'Missing date range' }, { status: 400 });
+    }
+
+    const events = await fetchCalendarEvents(
+      session.accessToken,
+      new Date(startDate).toISOString(),
+      new Date(endDate).toISOString()
+    );
+
+    return NextResponse.json({
+      success: true,
+      events,
+    });
+  } catch (error: any) {
+    console.error('Calendar fetch error:', error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
